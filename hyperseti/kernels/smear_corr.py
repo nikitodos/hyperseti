@@ -1,59 +1,63 @@
-import cupy as cp
 import numpy as np
 
+from ..xp_compat import cp, HAS_GPU, get_xp, resolve_device
 from .kernel_manager import KernelManager
+from .smear_corr_cpu import smear_corr_kernel_cpu
 from ..data_array import DataArray
 
-smear_corr_kernel = cp.RawKernel(r'''
-extern "C" __global__
-    __global__ void smearCorrKernel
-        (float *idata, float *odata, int *N_chan_smear, int F, int D)
-        /* Each thread computes a different dedoppler sum for a given channel
-         
-         F: N_frequency channels
-         D: N_dedopp steps
-        
-         *idata: Data array, (D x F) shape
-         *odata: Data array, (D x F) shape
-         *N_chan_smear: Number of channels smearing (one entry per timestep, Dx1 vector)
-        */
-        {
-        
-        // Setup thread index
-        // Thread index == frequency index
-        const int f = blockIdx.x * blockDim.x + threadIdx.x;  
-        const int osize = F * D;
-
-        int N_smear = 1;
-        int idx     = 0;
-        
-        if (f < F) {
-          for (int d = 0; d < D; d++) {
-            // idx = start_channel   +  timestep   
-            idx    = f               + (F * d); 
-
-            // Get N_smear from input vector
-            N_smear = N_chan_smear[d];
+if HAS_GPU:
+    smear_corr_kernel = cp.RawKernel(r'''
+    extern "C" __global__
+        __global__ void smearCorrKernel
+            (float *idata, float *odata, int *N_chan_smear, int F, int D)
+            /* Each thread computes a different dedoppler sum for a given channel
+             
+             F: N_frequency channels
+             D: N_dedopp steps
             
-            if (N_smear > 1) {
-                // Do the moving average on each data point
-                if (f + N_smear/2 < F && f - N_smear/2 > 0) {
-                    float movsum = 0;
-                    for (int i = 0; i < N_smear; i++) {
-                        movsum += idata[idx+i-N_smear/2];
-                    }   
-                    odata[idx] = movsum / sqrt((float)N_smear);
-                } else {
-                    odata[idx] = idata[idx];
-                }
-            } else { 
-                odata[idx] = idata[idx];
-            }  
-          }
-        }
-    }
+             *idata: Data array, (D x F) shape
+             *odata: Data array, (D x F) shape
+             *N_chan_smear: Number of channels smearing (one entry per timestep, Dx1 vector)
+            */
+            {
+            
+            // Setup thread index
+            // Thread index == frequency index
+            const int f = blockIdx.x * blockDim.x + threadIdx.x;  
+            const int osize = F * D;
 
-''', 'smearCorrKernel')
+            int N_smear = 1;
+            int idx     = 0;
+            
+            if (f < F) {
+              for (int d = 0; d < D; d++) {
+                // idx = start_channel   +  timestep   
+                idx    = f               + (F * d); 
+
+                // Get N_smear from input vector
+                N_smear = N_chan_smear[d];
+                
+                if (N_smear > 1) {
+                    // Do the moving average on each data point
+                    if (f + N_smear/2 < F && f - N_smear/2 > 0) {
+                        float movsum = 0;
+                        for (int i = 0; i < N_smear; i++) {
+                            movsum += idata[idx+i-N_smear/2];
+                        }   
+                        odata[idx] = movsum / sqrt((float)N_smear);
+                    } else {
+                        odata[idx] = idata[idx];
+                    }
+                } else { 
+                    odata[idx] = idata[idx];
+                }  
+              }
+            }
+        }
+
+    ''', 'smearCorrKernel')
+else:
+    smear_corr_kernel = None
 
 
 class SmearCorrMan(KernelManager):
@@ -63,41 +67,69 @@ class SmearCorrMan(KernelManager):
         self.N_chan    = None
         self.N_beam    = None
         self.N_dedopp  = None
+        self.device    = None
     
-    def init(self, N_dedopp: int, N_beam: int, N_chan: int):
+    def init(self, N_dedopp: int, N_beam: int, N_chan: int, device: str='gpu'):
         """ Initialize (or reinitialize) kernel 
         
         Args:
             N_dedopp (int): Number of dedoppler trials in input data
             N_beam (int): Number of beams in input data
             N_chan (int): Number of frequency channels
+            device (str): 'gpu' or 'cpu'
         """
+        device = resolve_device(device)
+
         reinit = False
         if N_chan != self.N_chan: reinit = True
         if N_beam != self.N_beam: reinit = True
         if N_dedopp != self.N_dedopp: reinit = True
+        if device != self.device: reinit = True
 
         if reinit:
             self.N_chan    = N_chan
             self.N_beam    = N_beam
             self.N_dedopp  = N_dedopp
+            self.device    = device
 
+            xp = cp if device == 'gpu' else np
             odata = np.zeros(shape=(N_dedopp, N_beam, N_chan), dtype='float32')
-            self.workspace['odata'] = cp.asarray(odata)
+            self.workspace['odata'] = xp.asarray(odata)
 
-            N_grid = np.min((N_chan, 1024))
-            self._grid  = (N_grid, )
-            self._block = (N_chan // self._grid[0], ) 
+            if device == 'gpu':
+                N_grid = np.min((N_chan, 1024))
+                self._grid  = (N_grid, )
+                self._block = (N_chan // self._grid[0], ) 
+            else:
+                self._grid = None
+                self._block = None
 
     def execute(self, dedopp_array: DataArray) -> DataArray:
         """ Execute kernel on dedoppler data array """
-        drates = cp.asarray(dedopp_array.drift_rate.data)
+        xp = get_xp(dedopp_array.data)
+        drates = xp.asarray(dedopp_array.drift_rate.data)
         df = dedopp_array.frequency.step.to('Hz').value
         dt = dedopp_array.metadata['integration_time'].to('s').value / dedopp_array.metadata['n_integration']
-        smearing_nchan = cp.abs(dt * drates / df).astype('int32')
-        smearing_nchan_gpu = cp.asarray(smearing_nchan)
+        smearing_nchan = xp.abs(dt * drates / df).astype('int32')
+        smearing_nchan_gpu = xp.asarray(smearing_nchan)
 
-        smear_corr_kernel(self._grid, self._block, (dedopp_array.data, self.workspace['odata'], smearing_nchan_gpu, self.N_chan, self.N_dedopp))
+        if self.device == 'gpu':
+            smear_corr_kernel(self._grid, self._block, (dedopp_array.data, self.workspace['odata'], smearing_nchan_gpu, self.N_chan, self.N_dedopp))
+        else:
+            # CPU path operates per-beam: the CUDA kernel's flat (D x F)
+            # indexing (idx = f + F*d) implicitly assumes a single beam
+            # slice too (N_beam is part of workspace allocation, not of
+            # the kernel's own indexing), so we loop over beams here.
+            N_dedopp, N_beam, N_chan = dedopp_array.data.shape
+            out = np.empty_like(self.workspace['odata'])
+            smear_np = np.asarray(smearing_nchan).astype(np.int32)
+            for beam_id in range(N_beam):
+                out[:, beam_id, :] = smear_corr_kernel_cpu(
+                    np.asarray(dedopp_array.data[:, beam_id, :]),
+                    smear_np, self.N_chan, self.N_dedopp,
+                )
+            self.workspace['odata'] = out
+
         dedopp_array.data = self.workspace['odata']
         return dedopp_array
 
@@ -124,6 +156,7 @@ def apply_smear_corr(dedopp_array: DataArray, mm: SmearCorrMan=None) -> DataArra
         sc = mm
     else:
         sc = SmearCorrMan()
-    sc.init(*dedopp_array.shape)
+    device = 'gpu' if get_xp(dedopp_array.data) is cp and HAS_GPU else 'cpu'
+    sc.init(*dedopp_array.shape, device=device)
     dedopp_array = sc.execute(dedopp_array)
     return dedopp_array

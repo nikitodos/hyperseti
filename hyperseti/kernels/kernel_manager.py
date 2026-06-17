@@ -1,4 +1,4 @@
-import cupy as cp
+from ..xp_compat import cp, HAS_GPU
 
 class KernelManager(object):
     """ Class for managing cupy RawKernels and allocated memory 
@@ -38,9 +38,10 @@ class KernelManager(object):
     def init(self):
         """ This function should be supplied by the user, and should set:
         
-        self._grid     - grid dims
-        self._block    - block dims
-        self.workspace - all cupy arrays required for workspace
+        self._grid     - grid dims (GPU subclasses only)
+        self._block    - block dims (GPU subclasses only)
+        self.workspace - all arrays required for workspace (numpy or cupy,
+                          depending on the subclass)
         """
         raise NotImplementedError
 
@@ -52,9 +53,15 @@ class KernelManager(object):
         """ Free memory when deleted 
         
         See https://docs.cupy.dev/en/stable/user_guide/memory.html
+
+        Only touches the CuPy memory pool if a GPU is actually in use;
+        CPU-only KernelManager subclasses hold plain numpy arrays, which
+        the regular Python GC already reclaims, and `cp` may just be the
+        numpy alias in that case (no get_default_memory_pool to call).
         """
-        mempool = cp.get_default_memory_pool()
         for k, v in self.workspace.items():
             self.workspace[k] = None
-        mempool.free_all_blocks()
+        if HAS_GPU:
+            mempool = cp.get_default_memory_pool()
+            mempool.free_all_blocks()
         pass

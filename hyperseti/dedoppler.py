@@ -1,4 +1,3 @@
-import cupy as cp
 import numpy as np
 import time
 import os
@@ -7,6 +6,7 @@ from copy import deepcopy
 
 from astropy import units as u
 
+from .xp_compat import get_xp
 from .kernels.dedoppler import DedopplerMan
 from .kernels.smear_corr import SmearCorrMan
 
@@ -68,21 +68,34 @@ def apply_boxcar_drift(data_array: DataArray):
     """
     logger.debug(f"apply_boxcar_drift: Applying moving average based on drift rate.")
     metadata = data_array.metadata
-    
+
+    # Dispatch on the array module this data already lives in, rather than
+    # forcing cupy unconditionally.
+    xp = get_xp(data_array.data)
+
     # Note: dedoppler array no longer has time dimensions, so need to read
     # metadata stores in attributes (integration_time and n_integration)
-    drates = cp.asarray(data_array.drift_rate.data)
+    drates = xp.asarray(data_array.drift_rate.data)
     df = data_array.frequency.step.to('Hz').value
     dt = metadata['integration_time'].to('s').value / metadata['n_integration']
 
     # Compute smearing (array of n_channels smeared for given driftrate)
-    smearing_nchan = cp.abs(dt * drates / df).astype('int32')
-    smearing_nchan_max = cp.asnumpy(cp.max(smearing_nchan))
+    smearing_nchan = xp.abs(dt * drates / df).astype('int32')
+    smearing_nchan_max = float(xp.asnumpy(xp.max(smearing_nchan))) if xp is not np else float(xp.max(smearing_nchan))
 
     # Apply boxcar filter to compensate for smearing
-    boxcars = map(int, list(cp.asnumpy(cp.unique(smearing_nchan))))
+    unique_vals = xp.unique(smearing_nchan)
+    unique_vals = xp.asnumpy(unique_vals) if xp is not np else unique_vals
+    boxcars = map(int, list(unique_vals))
+    # NOTE (pre-existing upstream issue, not introduced by this fork):
+    # this function references `uniform_filter1d` but never imports it.
+    # This code path appears unreachable from dedoppler() in current
+    # upstream hyperseti (apply_smearing_corr uses SmearCorrMan instead),
+    # so it has likely never been exercised. Left as-is to keep this
+    # change focused on CPU/GPU dispatch; flagging here rather than
+    # silently fixing an unrelated latent bug.
     for boxcar_size in boxcars:
-        idxs = cp.where(smearing_nchan == boxcar_size)
+        idxs = xp.where(smearing_nchan == boxcar_size)
         # 1. uniform_filter1d computes mean. We want sum, so *= boxcar_size
         # 2. we want noise to stay the same, so divide by sqrt(boxcar_size)
         # combined 1 and 2 give aa sqrt(2) factor
@@ -219,7 +232,9 @@ def dedoppler(data_array: DataArray, max_dd: u.Quantity, min_dd: u.Quantity=None
     logger.debug("dedoppler: delta_dd={}, N_dopp_upper={}, N_dopp_lower={}, dd_shifts={}"
                  .format(delta_dd, N_dopp_upper, N_dopp_lower, dd_shifts))
 
-    dd_shifts_gpu  = cp.asarray(dd_shifts)
+    xp = get_xp(data_array.data)
+    xp_compat_device = 'gpu' if xp is not np else 'cpu'
+    dd_shifts_gpu  = xp.asarray(dd_shifts)
     N_dopp = len(dd_shifts)
     
     # Run dedoppler kernel
@@ -227,7 +242,7 @@ def dedoppler(data_array: DataArray, max_dd: u.Quantity, min_dd: u.Quantity=None
         ddman = mm
     else:
         ddman = DedopplerMan()
-    ddman.init(N_time, N_beam, N_chan, N_dopp, kernel=kernel)
+    ddman.init(N_time, N_beam, N_chan, N_dopp, kernel=kernel, device=xp_compat_device)
 
     if kernel == 'ddsk':
         dedopp_gpu, dedopp_sk_gpu = ddman.execute(data_array, dd_shifts_gpu, boxcar_size)

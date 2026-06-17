@@ -1,8 +1,8 @@
-import cupy as cp
 import numpy as np
 import time
 import os
 
+from .xp_compat import get_xp
 from .data_array import DataArray
 
 #logging
@@ -10,37 +10,43 @@ from .log import get_logger
 logger = get_logger('hyperseti.normalize')
 
 
-def normalize(data_array: DataArray,  mask: cp.ndarray=None, poly_fit: int=0):
-    """ Apply normalization on GPU
+def normalize(data_array: DataArray,  mask=None, poly_fit: int=0):
+    """ Apply normalization on GPU or CPU
     
     Applies normalisation (data - mean) / stdev
     
     Args: 
         data (DataArray): Data to preprocess (time, beam_id, frequency)
-        mask (cp.array): 1D Channel mask for RFI flagging
+        mask (np.ndarray or cp.ndarray): 1D Channel mask for RFI flagging
         poly_fit (int): Fit polynomial of degree N, 0 = no fit.
         
-    Returns: d_gpu (cp.array): Normalized data
+    Returns: data_array (DataArray): Normalized data. The array module used
+        (numpy or cupy) is whichever data_array.data already used coming in
+        -- this function does not move data between devices.
     """
+    # Dispatch on whatever array module produced this data; this is what
+    # lets the same function body run unmodified on CPU and GPU.
+    xp = get_xp(data_array.data)
+
     # Normalise
     logger.debug(f"Poly fit = {poly_fit}")
     t0 = time.time()
     
     # Get rid of NaNs - TODO: figure out why there are NaNs ...
-    data_array.data = cp.nan_to_num(data_array.data)
+    data_array.data = xp.nan_to_num(data_array.data)
     
-    d_flag = cp.copy(data_array.data)
+    d_flag = xp.copy(data_array.data)
 
     n_int, n_ifs, n_chan = data_array.data.shape
 
     # Setup 1D channel mask -- used for polynomial fitting
     if mask is None: 
-        mask = cp.zeros(n_chan, dtype='bool')
+        mask = xp.zeros(n_chan, dtype='bool')
 
     # Do polynomial fit and compute stats (with masking)
-    d_mean_ifs, d_std_ifs = cp.zeros(n_ifs), cp.zeros(n_ifs)
+    d_mean_ifs, d_std_ifs = xp.zeros(n_ifs), xp.zeros(n_ifs)
     if poly_fit > 0:
-        d_poly_ifs = cp.zeros((n_ifs, poly_fit + 1))
+        d_poly_ifs = xp.zeros((n_ifs, poly_fit + 1))
 
     N_masked = mask.sum()
     N_flagged = N_masked * n_ifs * n_int
@@ -57,21 +63,21 @@ def normalize(data_array: DataArray,  mask: cp.ndarray=None, poly_fit: int=0):
         
         # Ignore mask and ignore this data channel
         # TODO: How to make user notice if in a batch run?
-        mask = cp.zeros(n_chan, dtype='bool')
-        data_array.data = cp.ones_like(data_array.data)
+        mask = xp.zeros(n_chan, dtype='bool')
+        data_array.data = xp.ones_like(data_array.data)
 
     t0p = time.time()
     
     for ii in range(n_ifs):
-        x    = cp.arange(n_chan, dtype='float64') 
-        xc   = cp.compress(~mask, x)
-        dfit = cp.compress(~mask, data_array.data[:, ii].mean(axis=0))
+        x    = xp.arange(n_chan, dtype='float64') 
+        xc   = xp.compress(~mask, x)
+        dfit = xp.compress(~mask, data_array.data[:, ii].mean(axis=0))
 
         if poly_fit > 0:
             try:
                 # WAR: int64 dtype causes issues in cupy 10 (19.04.2022)
-                poly_coeffs = cp.polyfit(xc, dfit, poly_fit)
-                p    = cp.poly1d(poly_coeffs)
+                poly_coeffs = xp.polyfit(xc, dfit, poly_fit)
+                p    = xp.poly1d(poly_coeffs)
                 fit   = p(x)
                 dfit  -=  p(xc)
                 data_array.data[:, ii] = data_array.data[:, ii] - fit
@@ -79,16 +85,16 @@ def normalize(data_array: DataArray,  mask: cp.ndarray=None, poly_fit: int=0):
                 # WAR for TypeError: expected non-empty vector for x 
                 logger.critical(f"Error encountered in poly fitting!")
                 poly_coeffs = np.zeros(poly_fit)
-                dfit = cp.compress(~mask, data_array.data[:, ii].mean(axis=0))
+                dfit = xp.compress(~mask, data_array.data[:, ii].mean(axis=0))
             
             d_poly_ifs[ii] = poly_coeffs
         
 
         # compute mean and stdev
-        dmean = cp.nanmean(dfit)
-        dvar  = cp.nanmean((data_array.data[:, ii] - dmean)**2, axis=0)
-        dvar  = cp.nanmean(cp.compress(~mask, dvar))
-        dstd  = cp.sqrt(dvar)
+        dmean = xp.nanmean(dfit)
+        dvar  = xp.nanmean((data_array.data[:, ii] - dmean)**2, axis=0)
+        dvar  = xp.nanmean(xp.compress(~mask, dvar))
+        dstd  = xp.sqrt(dvar)
         d_mean_ifs[ii] = dmean
         d_std_ifs[ii]  = dstd
 

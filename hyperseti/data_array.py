@@ -5,7 +5,7 @@ from typing import Any, Callable
 from astropy.coordinates import SkyCoord
 from astropy.units import Quantity
 import itertools
-import cupy as cp
+from .xp_compat import cp, get_xp, asnumpy, to_device, HAS_GPU
 from copy import deepcopy
 
 # Dask SVG HTML plotting
@@ -76,7 +76,7 @@ class DataArray(object):
     @property
     def space(self) -> str:
         """ Return data memory space (GPU or CPU) """
-        if isinstance(self.data, cp.ndarray):
+        if HAS_GPU and isinstance(self.data, cp.ndarray):
             return 'gpu'
         else:
             return 'cpu'
@@ -182,8 +182,8 @@ class DataArray(object):
         
         See https://numpy.org/neps/nep-0030-duck-array-protocol.html
         """
-        if isinstance(self.data, cp.ndarray):
-            return cp.asnumpy(self.data)
+        if HAS_GPU and isinstance(self.data, cp.ndarray):
+            return asnumpy(self.data)
         else:
             return self.data[:]
 
@@ -219,9 +219,9 @@ class DataArray(object):
         data = self.data[slices]
         logger.debug(f"sel data shape: {data.shape}")
         if space == 'cpu':
-            data = cp.asnumpy(data)
+            data = asnumpy(data)
         elif space == 'gpu':
-            data = cp.asarray(data)
+            data = to_device(data, device='gpu')
         else:
             pass   
         return DataArray(data, self.dims, new_scales, self.attrs, units=self.units,
@@ -286,7 +286,7 @@ class DataArray(object):
         func = None
         if callable(transform):
             func = transform
-        elif isinstance(self.data, cp.ndarray):
+        elif HAS_GPU and isinstance(self.data, cp.ndarray):
             cp_funcs = dir(cp)
             if transform in cp_funcs:
                 func = getattr(cp, transform)

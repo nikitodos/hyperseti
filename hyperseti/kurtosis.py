@@ -1,5 +1,6 @@
-import cupy as cp
 import numpy as np
+
+from .xp_compat import get_xp
 
 #logging
 from .log import get_logger
@@ -7,25 +8,27 @@ from .data_array import DataArray
 logger  = get_logger('hyperseti.kurtosis')
 
 
-def spectral_kurtosis(x: DataArray) -> cp.ndarray:
-    """ GPU Generalized Spectral Kurtosis Kernel 
+def spectral_kurtosis(x: DataArray):
+    """ Generalized Spectral Kurtosis Kernel (GPU or CPU)
     
     Args:
         x (DataArray): Data to compute SK on, (frequency, beam_id, time)
     
     Returns:
-        sk (cp.ndarray): Array of computed SK estimates
+        sk (np.ndarray or cp.ndarray): Array of computed SK estimates,
+            same array module as x.data
     
     Notes:
         Will fail if data.shape[0] == 1
     """
+    xp = get_xp(x.data)
     metadata = x.metadata
     samps_per_sec = (1.0 / np.abs(metadata['frequency_step'])).to('s') / 2 # Nyq sample rate for channel
     N_acc = int(metadata['time_step'].to('s') / samps_per_sec)
     logger.debug(f'rescaling SK by {N_acc}')
     
-    x_sum  = cp.sum(x.data, axis=0)
-    x2_sum = cp.sum(x.data**2, axis=0)
+    x_sum  = xp.sum(x.data, axis=0)
+    x2_sum = xp.sum(x.data**2, axis=0)
     n = x.data.shape[0]
     return (N_acc*n+1) / (n-1) * (n*(x2_sum / (x_sum*x_sum)) - 1).squeeze()
 
@@ -33,7 +36,7 @@ def spectral_kurtosis(x: DataArray) -> cp.ndarray:
 def sk_flag(data_array: DataArray, n_sigma: float=None, 
             n_sigma_upper: float=10, n_sigma_lower: float=10, 
             flag_upper: bool=True, flag_lower: bool=True, 
-            pad_mask: bool=True) -> cp.ndarray:
+            pad_mask: bool=True):
     """ Apply spectral kurtosis flagging 
     
     Args:
@@ -48,12 +51,14 @@ def sk_flag(data_array: DataArray, n_sigma: float=None,
         pad_mask (bool): Mask either side of a masked value (e.g. 00100 -> 01110)
     
     Returns:
-        mask (cp.array): Array of True/False flags per channel
+        mask (np.ndarray or cp.ndarray): Array of True/False flags per channel
     
     Notes:
         sk_flag upper and lower stdev is computed on log2(sk), as the minimum
         spectral kurtosis (for a CW signal) approaches 0. 
     """
+    xp = get_xp(data_array.data)
+
     if n_sigma is not None:
         n_sigma_lower = n_sigma
         n_sigma_upper = n_sigma
@@ -67,7 +72,7 @@ def sk_flag(data_array: DataArray, n_sigma: float=None,
     sk = spectral_kurtosis(data_array)
 
     # See SK technote 
-    log_sk   = cp.log2(sk) 
+    log_sk   = xp.log2(sk) 
     std_log  = 2.0 / np.sqrt(N_acc)         # Based on setigen
     mean_log = -1.25 / N_acc                # Based on setigen 
     

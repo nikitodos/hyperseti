@@ -1,6 +1,6 @@
 import pylab as plt
-import cupy as cp
 import pandas as pd
+from .xp_compat import asnumpy
 from .data_array import DataArray
 
 def _get_extent(data_array, xaxis: str, yaxis: str) -> tuple:
@@ -51,7 +51,7 @@ def _imshow(data_array: DataArray, xaxis: str, yaxis: str,
         before plotting
     """
 
-    data = cp.asnumpy(data_array.data[:, beam_id]).squeeze()
+    data = asnumpy(data_array.data[:, beam_id]).squeeze()
     
     if 'apply_transform' in kwargs:
         transform = kwargs.pop('apply_transform')

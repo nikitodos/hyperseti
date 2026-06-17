@@ -1,15 +1,13 @@
-import cupy as cp
 import numpy as np
 from functools import wraps
 from inspect import signature
 from astropy.units import Unit, Quantity
-import numpy as np
-import cupy as cp
 import pandas as pd
 import copy
 import time
 from typing import Any, Callable
 
+from .xp_compat import cp, HAS_GPU
 from .data_array import DataArray, from_metadata, split_metadata
 from .dimension_scale import DimensionScale, TimeScale
 
@@ -23,10 +21,18 @@ time_logger = get_logger('hyperseti.timer')
 def attach_gpu_device(new_id: int):
     """ On demand, switch to GPU ID new_id.
 
+    No-op on CPU-only systems (HAS_GPU == False): there is no device to
+    attach to, so we just log and return rather than raising, since this
+    is called unconditionally from find_et()/GulpPipeline regardless of
+    the device the pipeline will actually run on.
+
     Args:
         new_id (int): Integer ID of GPU to bind to
     """
     global current_gpu_id
+    if not HAS_GPU:
+        logger.debug("attach_gpu_device: No GPU available, skipping (CPU-only mode)")
+        return
     try:
         if new_id == current_gpu_id:
             logger.info(f"attach_gpu_device: Already using GPU ({new_id})")

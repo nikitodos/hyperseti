@@ -1,11 +1,11 @@
 from __future__ import annotations  # Treat type hints as strings to avoid circular import
 
 import pandas as pd
-import cupy as cp
 import numpy as np
 import pylab as plt
 from astropy import units as u
 
+from hyperseti.xp_compat import asnumpy, to_device
 from hyperseti.plotting import imshow_dedopp, imshow_waterfall, overlay_hits
 from hyperseti.data_array import DataArray
 from hyperseti.dedoppler import dedoppler, calc_delta_dd
@@ -91,9 +91,9 @@ class HitBrowser(object):
             {'frequency': slice(chan0, chanX)}
             )
         if space == 'cpu':
-            data_sel.data = cp.asnumpy(data_sel.data)
+            data_sel.data = asnumpy(data_sel.data)
         else:
-            data_sel.data = cp.asarray(data_sel.data)
+            data_sel.data = to_device(data_sel.data, device='gpu')
         
         if apply_preprocessing:
             if hit.get('b0_gulp_mean', None):
@@ -169,15 +169,15 @@ class HitBrowser(object):
             # Reload data so we can pad with maximum dd
             n_chan_dedopp = abs(int(max_dd / delta_dd))
             hit_darr = self.extract_hit(hit_idx, padding + n_chan_dedopp, space='cpu')
-            hit_darr.data = cp.asarray(hit_darr.data)
+            hit_darr.data = to_device(hit_darr.data, device='gpu')
             if plot == 'ddsk':
                 hit_dedopp, hit_dedopp_sk = dedoppler(hit_darr, max_dd=max_dd, 
                 plan='optimal', kernel='ddsk')
-                hit_dedopp_sk.data = cp.asnumpy(hit_dedopp_sk.data)
+                hit_dedopp_sk.data = asnumpy(hit_dedopp_sk.data)
             else:
                 hit_dedopp = dedoppler(hit_darr, max_dd=max_dd, 
                 plan='optimal', kernel='dedoppler')
-            hit_dedopp.data = cp.asnumpy(hit_dedopp.data)
+            hit_dedopp.data = asnumpy(hit_dedopp.data)
 
         if plot == 'waterfall':
             kwargs = plot_config.get('waterfall', {})

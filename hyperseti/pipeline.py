@@ -1,4 +1,3 @@
-import cupy as cp
 import numpy as np
 import time
 import pandas as pd
@@ -10,6 +9,7 @@ import setigen as stg
 
 from copy import deepcopy
 
+from .xp_compat import cp, get_xp, asnumpy, to_device, resolve_device, HAS_GPU
 from .dedoppler import dedoppler, calc_ndrift
 from .normalize import normalize
 from .hits import hitsearch, merge_hits, create_empty_hits_table
@@ -61,7 +61,7 @@ class GulpPipeline(object):
         ```
     """
 
-    def __init__(self, data_array: DataArray, config: dict, gpu_id: int=None, kernel_managers=None):
+    def __init__(self, data_array: DataArray, config: dict, gpu_id: int=None, kernel_managers=None, device: str='auto'):
         """ Pipeline class to run on a gulp of data (e.g. a coarse channel)
 
         Args:
@@ -69,16 +69,33 @@ class GulpPipeline(object):
             config (dict): Dictionary of config values. Dictionary values are passed as 
                            keyword arguments to called functions. 
             gpu_id (int): Choose GPU to run pipeline on by integer ID (default None)
+            device (str): 'gpu', 'cpu', or 'auto' (default). 'auto' runs on
+                          whichever device data_array.data already lives on
+                          -- this is what makes a CPU-only setup work
+                          without any extra argument. Passing 'gpu' or
+                          'cpu' explicitly will move the data if it isn't
+                          already on that device.
         """
         self.data_array = data_array
         self.config = deepcopy(config)
         self._called_count = 0
 
-        if not isinstance(self.data_array.data, cp.ndarray):
-            logger.warning(f"GulpPipeline init: Data not in cupy.ndarray, attempting to copy data to GPU")
-            self.data_array.data = cp.asarray(self.data_array.data)
+        if device == 'auto':
+            # Infer device from whatever the data already is -- this is
+            # the key change that lets the same pipeline run unmodified
+            # on a machine with no GPU at all.
+            device = 'gpu' if get_xp(self.data_array.data) is cp and HAS_GPU else 'cpu'
+        else:
+            device = resolve_device(device)
+
+        self.device = device
+
+        current_space = self.data_array.space  # 'gpu' or 'cpu', from DataArray.space
+        if current_space != device:
+            logger.info(f"GulpPipeline init: Moving data from {current_space} to {device}")
+            self.data_array.data = to_device(self.data_array.data, device=device)
         
-        if gpu_id is not None:
+        if gpu_id is not None and device == 'gpu':
             attach_gpu_device(gpu_id)
         self.gpu_id = gpu_id
 
@@ -152,6 +169,71 @@ class GulpPipeline(object):
         if self.config['preprocess'].get('blank_edges', 0):
             logger.info(f"GulpPipeline.preprocess: Applying edge blanking")
             self.data_array = blank_edges(self.data_array, **self.config['preprocess']['blank_edges'])
+
+        # KLT-based RFI removal / noise estimation, applied AFTER
+        # normalize() (operating on already-whitened data, so the
+        # discarded-eigenvalue noise estimate is more directly
+        # interpretable) and BEFORE blank_extrema(). This is the "cheap"
+        # integration agreed in the architecture: one stationary KLT per
+        # gulp/sub-window, not a per-drift-trial KLT (that's the
+        # de-shift-then-covariance version left as future work). Two
+        # separate, independently toggleable effects on purpose: RFI
+        # removal and noise estimation are distinct mechanisms (see
+        # klt.py module docstring) and the ablation needs to be able to
+        # isolate them.
+        klt_cfg = self.config['preprocess'].get('klt', None)
+        if klt_cfg:
+            from .klt import klt_denoise
+            from .xp_compat import get_xp
+
+            klt_window = klt_cfg.get('klt_window', 256)
+            # NOTE on this default: the original seti_klt script used
+            # 0.95 as its threshold. Empirically (see validation/
+            # run_ablation.py results), 0.95 is too aggressive whenever
+            # a strong RFI line and a weaker ET signal fall in the same
+            # window -- both get captured as "dominant correlated
+            # structure" and both get removed. Lowering var_frac (fewer
+            # retained eigenvectors) reduces this risk at the cost of
+            # leaving more residual RFI uncleaned; this is a genuine
+            # trade-off to be characterized in the ablation, not a fixed
+            # "right" value. 0.5 is a more conservative starting point
+            # based on the dataset tested so far; tune per-dataset.
+            var_frac = klt_cfg.get('var_frac', 0.5)
+            apply_cleaning = klt_cfg.get('apply_cleaning', True)
+            estimate_noise = klt_cfg.get('estimate_noise', True)
+
+            xp = get_xp(self.data_array.data)
+            logger.info(f"GulpPipeline.preprocess: Applying KLT (window={klt_window}, var_frac={var_frac}, "
+                        f"apply_cleaning={apply_cleaning}, estimate_noise={estimate_noise})")
+
+            n_time, n_beam, n_chan = self.data_array.data.shape
+            klt_noise_var = xp.zeros((n_beam, n_chan), dtype=xp.float64) if estimate_noise else None
+
+            for beam_idx in range(n_beam):
+                beam_slice = self.data_array.data[:, beam_idx, :]
+                cleaned, noise_var = klt_denoise(
+                    beam_slice, var_frac=var_frac, klt_window=klt_window,
+                    xp=xp, estimate_noise=estimate_noise,
+                )
+                if apply_cleaning:
+                    self.data_array.data[:, beam_idx, :] = cleaned
+                if estimate_noise:
+                    klt_noise_var[beam_idx, :] = noise_var
+
+            if estimate_noise:
+                # Stored alongside mean/std from normalize(), not
+                # replacing them -- this is consumed later (separately,
+                # not in this change) by anything that wants a
+                # per-subband noise estimate instead of normalize()'s
+                # single scalar std for the whole gulp.
+                #
+                # Guard: attrs['preprocess'] is normally created by
+                # normalize() (see pp_dict above), but KLT could in
+                # principle be enabled without normalize() in the config
+                # -- don't assume the key exists.
+                if 'preprocess' not in self.data_array.attrs:
+                    self.data_array.attrs['preprocess'] = {}
+                self.data_array.attrs['preprocess']['klt_noise_var'] = klt_noise_var
 
         # Extrema blanking is done *after* normalization
         if self.config['preprocess'].get('blank_extrema'):
@@ -289,6 +371,7 @@ def find_et(filename: str,
             log_config: bool=False,
             log_output: bool=False,
             gpu_id: int=0, 
+            device: str='auto',
             *args, **kwargs) -> pd.DataFrame:
     """ Find ET, serial version
     
@@ -304,7 +387,8 @@ def find_et(filename: str,
         sort_hits (bool): Sort hits by SNR after hitsearch is complete.
         gulp_size (int): Number of channels to process in one 'gulp' ('gulp' can be == 'coarse channel')
         n_overlap (int): Number of channels to overlap when reading data from DataArray
-        gpu_id (int): GPU device ID to use.
+        gpu_id (int): GPU device ID to use. Ignored if device=='cpu'.
+        device (str): 'gpu', 'cpu', or 'auto' (default: use GPU if available, else CPU).
    
     Returns:
         hits (pd.DataFrame): Pandas dataframe of all hits.
@@ -312,6 +396,8 @@ def find_et(filename: str,
     Notes:
         Passes keyword arguments on to GulpPipeline.run(). 
     """
+    device = resolve_device(device)
+
     if log_output:
         from logbook import FileHandler, NestedSetup
         from .log import log_to_screen
@@ -326,7 +412,7 @@ def find_et(filename: str,
         with open(config_out, 'w') as json_out:
             yaml.dump(pipeline_config, json_out)
 
-    msg = f"find_et: hyperseti version {HYPERSETI_VERSION}"
+    msg = f"find_et: hyperseti version {HYPERSETI_VERSION} (device={device})"
     proglog.info(msg)
     logger.info(pipeline_config)
 
@@ -338,15 +424,16 @@ def find_et(filename: str,
 
     out = []
 
-    attach_gpu_device(gpu_id)
+    if device == 'gpu':
+        attach_gpu_device(gpu_id)
     counter = 0
     n_gulps = ds.data.shape[-1] // gulp_size
     for d_arr in ds.iterate_through_data(dims={'frequency': gulp_size}, 
                                          overlap={'frequency': n_overlap}, 
-                                         space='gpu'):
+                                         space=device):
         counter += 1
         proglog.info(f"Progress {counter}/{n_gulps}")
-        pipeline = GulpPipeline(d_arr, pipeline_config, gpu_id=gpu_id)
+        pipeline = GulpPipeline(d_arr, pipeline_config, gpu_id=gpu_id, device=device)
         hits = pipeline.run()
         
         # Add some runtime info
@@ -357,16 +444,16 @@ def find_et(filename: str,
 
             if 'preprocess' in d_arr.attrs.keys():
                 for beam_idx in range(d_arr.shape[1]):
-                    hits[f'b{beam_idx}_gulp_mean'] = cp.asnumpy(d_arr.attrs['preprocess']['mean'][beam_idx])
-                    hits[f'b{beam_idx}_gulp_std']  = cp.asnumpy(d_arr.attrs['preprocess']['std'][beam_idx])
-                    hits[f'b{beam_idx}_gulp_flag_frac'] = cp.asnumpy(d_arr.attrs['preprocess'].get('flagged_fraction', 0))
+                    hits[f'b{beam_idx}_gulp_mean'] = asnumpy(d_arr.attrs['preprocess']['mean'][beam_idx])
+                    hits[f'b{beam_idx}_gulp_std']  = asnumpy(d_arr.attrs['preprocess']['std'][beam_idx])
+                    hits[f'b{beam_idx}_gulp_flag_frac'] = asnumpy(d_arr.attrs['preprocess'].get('flagged_fraction', 0))
                 
 
                 if d_arr.attrs['preprocess'].get('n_poly', 0) > 1:
                     n_poly = d_arr.attrs['preprocess']['n_poly']
                     hits['n_poly'] = n_poly
                     for pp in range(int(n_poly + 1)):
-                        hits[f'b{beam_idx}_gulp_poly_c{pp}'] = cp.asnumpy(d_arr.attrs['preprocess']['poly_coeffs'][beam_idx, pp])
+                        hits[f'b{beam_idx}_gulp_poly_c{pp}'] = asnumpy(d_arr.attrs['preprocess']['poly_coeffs'][beam_idx, pp])
 
             out.append(hits)
     if len(out) == 0:

@@ -1,5 +1,4 @@
 from copy import deepcopy
-import cupy as cp
 import numpy as np
 import time
 import pandas as pd
@@ -7,6 +6,7 @@ import os
 
 from astropy import units as u
 
+from .xp_compat import get_xp, asnumpy
 from .kernels.peak_finder import peak_find, PeakFinderMan
 
 from .data_array import DataArray
@@ -218,15 +218,17 @@ def hitsearch(dedopp_array: DataArray, threshold: int=10, min_fdistance: int=100
         pf = mm
     else:
         pf = PeakFinderMan()
-    pf.init(N_chan=dedopp_array.shape[2], N_time=dedopp_array.shape[0], K=K)  
+    pf_device = 'gpu' if get_xp(dedopp_data).__name__ == 'cupy' else 'cpu'
+    pf.init(N_chan=dedopp_array.shape[2], N_time=dedopp_array.shape[0], K=K, device=pf_device)  
 
     t0 = time.time()
     dfs = []
+    xp = get_xp(dedopp_data)
     for beam_idx in range(dedopp_data.shape[1]):
 
         ## TODO: Can we get rid of this copy?
         if dedopp_data.shape[1] > 1:
-            imgdata = cp.copy(cp.expand_dims(dedopp_data[:, beam_idx, :].squeeze(), 1))
+            imgdata = xp.copy(xp.expand_dims(dedopp_data[:, beam_idx, :].squeeze(), 1))
         else:
             imgdata = dedopp_data.squeeze()
 
@@ -239,7 +241,7 @@ def hitsearch(dedopp_array: DataArray, threshold: int=10, min_fdistance: int=100
         logger.debug(f"hitsearch: Peak find time: {(t1-t0)*1e3:2.2f}ms")
         t0 = time.time()
         # copy results over to CPU space
-        intensity, fcoords, dcoords = cp.asnumpy(intensity), cp.asnumpy(fcoords), cp.asnumpy(dcoords)
+        intensity, fcoords, dcoords = asnumpy(intensity), asnumpy(fcoords), asnumpy(dcoords)
         t1 = time.time()
         logger.debug(f"hitsearch: Peak find memcopy: {(t1-t0)*1e3:2.2f}ms")
 
@@ -270,7 +272,7 @@ def hitsearch(dedopp_array: DataArray, threshold: int=10, min_fdistance: int=100
                 if isinstance(sk_data, DataArray):
                     sk_data = sk_data.data
                 sk_vals = sk_data[dcoords, beam_idx, fcoords]
-                results['ddsk'] = cp.asnumpy(sk_vals)
+                results['ddsk'] = asnumpy(sk_vals)
 
 
             # Append numerical metadata keys

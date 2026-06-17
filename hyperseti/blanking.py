@@ -1,10 +1,10 @@
-import cupy as cp
 import numpy as np
 import time
 import pandas as pd
 
 from astropy import units as u
 
+from .xp_compat import get_xp
 from .data_array import DataArray
 from .kernels.blank_hits import BlankHitsMan
 
@@ -60,6 +60,7 @@ def blank_hit(data_array: DataArray, f0: u.Quantity, drate: u.Quantity, padding:
     TODO: Add check if drate * time_step > padding
     """
     n_time, n_pol, n_chans = data_array.data.shape
+    xp = get_xp(data_array.data)
 
     if isinstance(drate, u.Quantity):
         drate = drate.to('Hz/s').value
@@ -70,11 +71,11 @@ def blank_hit(data_array: DataArray, f0: u.Quantity, drate: u.Quantity, padding:
     i0 = data_array.frequency.index(f0)
     i_step = t_step * drate / f_step
 
-    i_off  = (i_step * cp.arange(n_time) + i0).astype('int64')
+    i_off  = (i_step * xp.arange(n_time) + i0).astype('int64')
     
     min_padding = int(abs(i_step) + 1)  # i_step == frequency smearing
     padding += min_padding 
-    i_time = cp.arange(n_time, dtype='int64')
+    i_time = xp.arange(n_time, dtype='int64')
     for p_off in range(padding):
         data_array.data[i_time, :, i_off] = 0
         data_array.data[i_time, :, i_off - p_off] = 0
@@ -125,25 +126,27 @@ def blank_hits_gpu(data_array: DataArray, df_hits: pd.DataFrame, padding: int=4,
         logger.debug(f"blank_hits: Kernel shape (grid, block) {(N_grid, ), (N_threads,)}")
 
         d_gpu = data_array.data
+        xp = get_xp(d_gpu)
+        device = 'gpu' if xp.__name__ == 'cupy' else 'cpu'
         N_time, N_beam, N_chan = d_gpu.shape
 
-        cidxs_gpu = cp.asarray(df_hits['gulp_channel_idx'], dtype='int32')
-        #boxcar_size_gpu = cp.asarray(df_hits['boxcar_size'], dtype='int32')
-        N_pad_lower = cp.asarray(df_hits['extent_lower'], dtype='int32') - padding
-        N_pad_upper = cp.asarray(df_hits['extent_upper'], dtype='int32') + padding
+        cidxs_gpu = xp.asarray(df_hits['gulp_channel_idx'], dtype='int32')
+        #boxcar_size_gpu = xp.asarray(df_hits['boxcar_size'], dtype='int32')
+        N_pad_lower = xp.asarray(df_hits['extent_lower'], dtype='int32') - padding
+        N_pad_upper = xp.asarray(df_hits['extent_upper'], dtype='int32') + padding
 
         #logger.debug(N_pad_lower)
         #logger.debug(N_pad_upper)
 
         # Convert dedoppler Hz/s into channels/timestep (can't use driftrate_idx in case they used 'stepped')
         df, dt = data_array.frequency.step.to('Hz').value, data_array.time.step.to('s').value
-        dd_shift_gpu = cp.asarray(np.round(df_hits['drift_rate'] / (df / dt)), dtype='int32')
+        dd_shift_gpu = xp.asarray(np.round(df_hits['drift_rate'] / (df / dt)), dtype='int32')
 
         if isinstance(mm, BlankHitsMan):
             bm = mm
         else:
             bm = BlankHitsMan()
-        bm.init(N_time, N_beam, N_chan, N_blank)
+        bm.init(N_time, N_beam, N_chan, N_blank, device=device)
         bm.execute(d_gpu, cidxs_gpu, dd_shift_gpu, N_pad_lower, N_pad_upper) 
 
         data_array.data = d_gpu

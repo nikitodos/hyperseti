@@ -1,36 +1,45 @@
-import cupy as cp
 import numpy as np
 import time
 import os
 from copy import deepcopy
 
-from cupyx.scipy.ndimage import uniform_filter1d
+from .xp_compat import cp, get_xp, HAS_GPU
+
+if HAS_GPU:
+    from cupyx.scipy.ndimage import uniform_filter1d as _uniform_filter1d_gpu
+from scipy.ndimage import uniform_filter1d as _uniform_filter1d_cpu
 
 #logging
 from .log import get_logger
 logger = get_logger('hyperseti.filter')
 
 
-def apply_boxcar(data: cp.ndarray, boxcar_size: int=1, axis: int=1, mode: str='gaussian') -> cp.ndarray:
+def apply_boxcar(data, boxcar_size: int=1, axis: int=1, mode: str='gaussian'):
     """ Apply moving boxcar filter and renormalise by sqrt(boxcar_size)
     
     Boxcar applies a moving MEAN to the data. 
     Optionally apply sqrt(N) factor to keep stdev of gaussian noise constant.
     
     Args:
-        data (cp.ndarray): Data to apply boxcar to
+        data (numpy.ndarray or cupy.ndarray): Data to apply boxcar to
         boxcar_size (int): Size of boxcar filter
         mode (str): Choose one of 'mean', 'mode', 'gaussian'
                     Where gaussian multiplies by sqrt(N) to maintain
                     stdev of Gaussian noise
     
     Returns: 
-        data (cp.ndarray): Data after boxcar filtering.
+        data (numpy.ndarray or cupy.ndarray): Data after boxcar filtering,
+            same array module as the input (dispatch is done on the input
+            array, not on a global device setting).
     """
     logger.debug(f"apply_boxcar: Running boxcar mode {mode} with size {boxcar_size}")
     if mode not in ('sum', 'mean', 'gaussian'):
         raise RuntimeError("Unknown mode. Only modes sum, mean or gaussian supported.")
     t0 = time.time()
+
+    xp = get_xp(data)
+    uniform_filter1d = _uniform_filter1d_gpu if (HAS_GPU and xp is cp) else _uniform_filter1d_cpu
+
     # This keeps stdev noise the same instead of decreasing by sqrt(N)
     data = uniform_filter1d(data, size=boxcar_size, axis=axis)
     if mode == 'gaussian':
