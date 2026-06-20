@@ -22,6 +22,7 @@ this directory for why):
     python inspect_header.py /path/to/extracted/R1_Lovell_files/*.fil
 """
 import sys
+import os
 import glob
 
 import numpy as np
@@ -54,6 +55,32 @@ def inspect_file(filepath):
                                    # decreases as channel index increases)
     nbits = h.get('nbits')
     nifs = h.get('nifs')
+
+    # nsamples is a legacy/optional SIGPROC header field (blimpy's own
+    # source comments it as "rarely used any more") and is None for at
+    # least some files in this archive (confirmed empirically). When
+    # absent, compute it the same way blimpy itself does internally
+    # (blimpy.io.sigproc.calc_n_ints_in_file): from the physical file
+    # size minus the header size, divided by bytes-per-integration --
+    # rather than silently skipping the duration calculation, which
+    # would hide exactly the number (file duration / time samples
+    # available) most needed before calibrating the injection grid.
+    if nsamples is None and nchans and nifs and nbits:
+        try:
+            from blimpy.io.sigproc import len_header
+            header_size = len_header(filepath)
+            filesize = os.path.getsize(filepath)
+            n_bytes_data = filesize - header_size
+            if nbits == 2:
+                nsamples = int(4 * n_bytes_data / (nchans * nifs))
+            elif nbits == 4:
+                nsamples = int(2 * n_bytes_data / (nchans * nifs))
+            else:
+                n_bytes = int(nbits / 8)
+                nsamples = int(n_bytes_data / (n_bytes * nchans * nifs))
+            print(f"  (nsamples missing from header; computed from file size: {nsamples})")
+        except Exception as e:
+            print(f"  (nsamples missing from header; could not compute from file size: {e})")
 
     duration_s = (nsamples * tsamp) if (nsamples and tsamp) else None
     bandwidth_mhz = (nchans * abs(foff)) if (nchans and foff) else None
