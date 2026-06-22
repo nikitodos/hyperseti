@@ -241,7 +241,18 @@ class PeakFinderMan(KernelManager):
         if d_arr.shape[1] > 1:
             d_gpu = xp.copy(d_arr[:, beam_id])
         else:
-            d_gpu = d_arr.squeeze()
+            # PRE-EXISTING UPSTREAM BUG, FIXED HERE (confirmed identical
+            # in this fork's pre-CPU-port history): a bare .squeeze()
+            # removes ALL size-1 axes, not just the beam axis it was
+            # meant to drop. This is harmless whenever N_dopp (the
+            # drift-trial axis) happens to be > 1, since then only the
+            # beam axis is size-1 -- but with N_dopp == 1 (the single-
+            # trial case enabled by the dedoppler.py max_dd=0 fix), BOTH
+            # the drift and beam axes are size-1, and a bare squeeze()
+            # collapses (1, 1, N_chan) to (N_chan,) instead of the
+            # required (1, N_chan), which then fails execute()'s shape
+            # assertion. Squeeze explicitly on the beam axis only.
+            d_gpu = d_arr.squeeze(axis=1)
 
         self.execute(d_gpu)
 

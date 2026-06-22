@@ -203,6 +203,26 @@ def dedoppler(data_array: DataArray, max_dd: u.Quantity, min_dd: u.Quantity=None
 
     metadata = deepcopy(data_array.metadata)
 
+    # PRE-EXISTING UPSTREAM BUG, FIXED HERE (confirmed identical in this
+    # fork's pre-CPU-port history via `git show HEAD:hyperseti/dedoppler.py`,
+    # not introduced by the CPU/GPU dispatch changes): the special case
+    # below ("if max_dd == 0 and min_dd is None") was structurally
+    # unreachable, because min_dd is unconditionally overwritten from
+    # None to -abs(max_dd) a few lines above, before this check runs --
+    # so `min_dd is None` was always False by the time it was evaluated,
+    # and a caller requesting a single drift=0 trial (max_dd=0,
+    # min_dd=None) always fell through to plan_stepped() instead, which
+    # raises "RuntimeError: No steps!" whenever the resulting integer
+    # channel-shift range rounds to a degenerate [0, 0] (guaranteed for
+    # max_dd=0, and also for any nonzero max_dd too small to reach one
+    # full channel of shift over the observation -- exactly the regime
+    # encountered validating against the FRB121102/Lovell dataset, whose
+    # 0.5 MHz channel width makes any physically realistic SETI drift
+    # rate sub-channel). Fixed by recording whether min_dd was
+    # originally None BEFORE it gets overwritten, and using that
+    # recorded flag (rather than re-checking min_dd itself) in the
+    # special-case condition.
+    min_dd_was_none = (min_dd is None)
     if min_dd is None:
         min_dd = np.abs(max_dd) * -1
     else:
@@ -216,7 +236,7 @@ def dedoppler(data_array: DataArray, max_dd: u.Quantity, min_dd: u.Quantity=None
     N_dopp_upper   = int(max_dd / delta_dd)
     N_dopp_lower   = int(min_dd / delta_dd)
 
-    if max_dd == 0 and min_dd is None:
+    if max_dd == 0 and min_dd_was_none:
         dd_shifts = np.array([0], dtype='int32')
     else:
         plans = {'optimal': plan_optimal,

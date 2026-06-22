@@ -252,3 +252,96 @@ against the real Zenodo dataset (not reachable from the development
 container's network allowlist); `cpu_gpu_crosscheck.py` has not been run
 on real GPU hardware. Both are the immediate next steps.
 
+### [2026-06-20] Real-header calibration fix + three pre-existing single-trial dedoppler bugs found and fixed
+
+Real headers from the FRB 121102 / Lovell archive were obtained (all 30
+files: `nchans` 800 or 672 depending on session, `tsamp=256us`,
+`foff=-0.5 MHz/chan`, `nifs=1`, 60.000s duration uniformly). Attempting
+to actually run `inject_and_recover.py` against a file matching these
+parameters (not yet the real archive itself -- still blocked by network
+access, see below -- but a synthetic file built with identical header
+parameters) surfaced four real bugs, none of which were visible from
+code review alone.
+
+**Fixed -- calibration bug (this repo's code, not upstream)**
+- `calibrate_injection_grid()`'s drift-rate grid was expressed as a
+  fraction of channel-width-per-timestep, reasoned (incorrectly) to
+  "automatically scale" to any file's resolution. At this dataset's
+  `tsamp=256us` (vs. the synthetic dataset's 18.25s), the same formula
+  produced drift rates of 1-40 **million** Hz/s -- five to six orders
+  of magnitude outside any physically realistic SETI range (~0.1-200
+  Hz/s; Sheikh et al. 2019, arXiv:1910.01148). Fixed by using fixed,
+  physically-motivated absolute Hz/s values instead, independent of the
+  file's native resolution.
+- Re-deriving the numbers properly then surfaced a second, more
+  fundamental issue: this dataset's channel width (0.5 MHz, a backend
+  built for broadband FRB detection, not narrowband SETI spectroscopy)
+  is too coarse by ~6 orders of magnitude to resolve ANY physically
+  realistic Doppler drift over the file's 60s duration (even 20 Hz/s
+  displaces an injected signal by ~0.0024 channels). This is a property
+  of the instrument, not a bug. `calibrate_injection_grid()`'s default
+  was changed to a single near-zero drift value (0.01 Hz/s), and the
+  real-data injection-recovery experiment is now explicitly scoped as a
+  **stationary-signal detection / KLT-damage test on a real background**,
+  not a dedoppler-search validation -- see the function's docstring for
+  the full reasoning. A dedoppler-capable real-data test would need a
+  fine-channelized dataset (a few Hz/channel or better), not this one.
+
+**Found and fixed -- three pre-existing upstream bugs**, all
+unreachable/unexercised until the change above actually required a
+single-trial (`max_dd=0`) dedoppler search (confirmed via `git show
+HEAD:<file>` against this fork's pre-CPU-port history that all three
+predate this fork's changes):
+- `hyperseti/dedoppler.py`: the `max_dd == 0 and min_dd is None`
+  special case (meant to return a single drift=0 trial) was
+  structurally unreachable -- `min_dd` is unconditionally overwritten
+  from `None` to `-abs(max_dd)` a few lines before that check runs, so
+  `min_dd is None` was always `False` by the time it was evaluated.
+  Every single-trial request silently fell through to the general
+  trial-grid construction instead, which raises `RuntimeError: No
+  steps!` whenever the requested range rounds to zero channels (which
+  it always does for `max_dd=0`, and also for the coarse-channel
+  near-zero-drift case above). Fixed by recording whether `min_dd` was
+  originally `None` before it gets overwritten.
+- `hyperseti/kernels/peak_finder.py` (`PeakFinder.hitsearch`) and
+  `hyperseti/hits.py` (`hitsearch`, in unused-but-latent code): both
+  called a bare `.squeeze()` on a `(N_dopp, N_beam, N_chan)` array
+  intending to drop only the size-1 beam axis. This is harmless when
+  `N_dopp > 1` (only the beam axis is size-1), but with `N_dopp == 1`
+  (the single-trial case the fix above enables) BOTH the drift and beam
+  axes are size-1, and a bare `.squeeze()` collapses `(1, 1, N_chan)` to
+  `(N_chan,)` instead of the required `(1, N_chan)`, failing a shape
+  assertion downstream. Fixed by squeezing explicitly on the beam axis
+  (`axis=1`) only, in both files.
+
+**Verified**: the full chain (`inject_and_recover.py` end-to-end, raw
+and KLT configurations, 4 SNR levels) now runs without error on a
+synthetic file matching this dataset's real header parameters, with
+`max_tchans` bounding the loaded time range (see below) rather than
+loading the full ~234k-sample file every grid point.
+
+**Added**
+- `load_real_background()` / `run_one_file()` gained a `max_tchans`
+  parameter (default 8192, CLI: `--max-tchans`). This dataset's files
+  are ~234000 time samples each (60s at 256us) -- `find_et()`'s
+  `gulp_size` bounds frequency channels per gulp, not time samples, so
+  it does not bound this on its own; without `max_tchans`, every
+  (file x SNR) grid point would reload and reprocess the full array.
+- `inspect_header.py`: `nsamples` is absent from this archive's headers
+  (and, it turns out, from any file `setigen.Frame.save_fil()` writes --
+  confirmed empirically, not specific to this archive). Previously this
+  silently skipped the file-duration calculation; now computed from
+  the file's physical size on disk (same method `blimpy` uses
+  internally, `blimpy.io.sigproc.calc_n_ints_in_file`), with the
+  computed value clearly logged as computed rather than read.
+- `inspect_all_filterbanks.bat`: a Windows batch script (a `.ps1`
+  PowerShell equivalent was tried first but the user's environment
+  rejected it -- not debugged further once the `.bat` worked) that
+  loops `inspect_header.py` over every `.fil` file in a directory and
+  writes a combined, timestamped log file alongside them.
+
+**Not yet done, explicitly**: `inject_and_recover.py` still has not
+been run against the actual archive files (only against a synthetic
+file matching their header) -- the next immediate step, now that the
+crashes blocking it are fixed.
+

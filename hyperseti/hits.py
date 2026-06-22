@@ -230,7 +230,16 @@ def hitsearch(dedopp_array: DataArray, threshold: int=10, min_fdistance: int=100
         if dedopp_data.shape[1] > 1:
             imgdata = xp.copy(xp.expand_dims(dedopp_data[:, beam_idx, :].squeeze(), 1))
         else:
-            imgdata = dedopp_data.squeeze()
+            # Same fix as kernels/peak_finder.py's hitsearch(): squeeze
+            # explicitly on the beam axis only, since a bare squeeze()
+            # would also collapse the drift-trial axis when N_dopp == 1
+            # (e.g. a max_dd=0 single-trial search), producing a 1D
+            # array where a 2D (1, N_chan) one is expected. `imgdata` is
+            # not currently consumed below (pf.hitsearch is called with
+            # dedopp_data directly, not imgdata -- see TODO above), but
+            # fixed here too so it isn't a latent copy of the same bug
+            # if that changes.
+            imgdata = dedopp_data.squeeze(axis=1)
 
         # Run peak find
         intensity, fcoords, dcoords = pf.hitsearch(dedopp_data, beam_id=beam_idx, threshold=threshold, min_spacing=min_fdistance)
